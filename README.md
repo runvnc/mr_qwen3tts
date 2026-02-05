@@ -1,0 +1,131 @@
+# mr_qwen3tts
+
+Qwen3-TTS streaming TTS plugin for MindRoot - drop-in replacement for `mr_eleven_stream`.
+
+## Overview
+
+This plugin connects to a remote Qwen3-TTS WebSocket server to provide:
+- Voice cloning from reference audio (3-10 seconds)
+- **Auto-transcription** using Whisper (no manual transcript needed)
+- Streaming audio output (ulaw 8kHz for SIP/telephony)
+- Realtime text streaming support
+- **Automatic voice cache warmup** for zero-latency first requests
+
+## Installation
+
+```bash
+pip install -e .
+```
+
+## Voice Configuration
+
+### Option 1: Per-Agent Voice (Recommended)
+
+Set the `voice_id` in the agent's persona to an **absolute path** to a reference audio file:
+
+```json
+{
+  "name": "MyAgent",
+  "persona": {
+    "voice_id": "/path/to/voice_sample.wav"
+  }
+}
+```
+
+The server will automatically transcribe the audio using Whisper.
+
+### Option 2: Default Voice (Fallback)
+
+Set environment variables for a default voice:
+
+```bash
+MR_QWEN3TTS_REF_AUDIO=/path/to/default_voice.wav
+MR_QWEN3TTS_REF_TEXT="Optional transcript"  # Will auto-transcribe if not set
+```
+
+### Option 3: Per-Request Voice
+
+Pass the audio path as `voice_id` in the command:
+
+```json
+{ "speak": { "text": "Hello", "voice_id": "/path/to/voice.wav" } }
+```
+
+## Environment Variables
+
+```bash
+# Required: WebSocket server URL
+MR_QWEN3TTS_WS_URL=ws://your-server:8765
+
+# Optional: Default voice (fallback if no persona voice_id)
+MR_QWEN3TTS_REF_AUDIO=/path/to/default_voice.wav
+MR_QWEN3TTS_REF_TEXT="Optional transcript"
+
+# Optional: Language setting
+MR_QWEN3TTS_LANGUAGE=Auto
+
+# Optional: Enable realtime streaming
+MR_QWEN3TTS_REALTIME_STREAM=1
+```
+
+## Voice Cache
+
+Voices are cached on the server indefinitely:
+
+1. **First request** for a voice: ~500-1000ms (transcription + voice init)
+2. **Subsequent requests**: ~100ms (generation only)
+
+The plugin also caches voice IDs locally, so reconnecting to the server
+with the same audio file will hit the server cache.
+
+## Usage
+
+### As a Command
+
+```json
+{ "speak": { "text": "Hello, this is a test message" } }
+```
+
+### As a Service
+
+```python
+from lib.providers.services import service_manager
+
+async for chunk in service_manager.stream_tts(text="Hello world", context=context):
+    # chunk is ulaw 8kHz audio (160 bytes = 20ms)
+    await send_to_sip(chunk)
+```
+
+## Server Setup
+
+See `/files/qwen3tts` for the WebSocket server.
+
+The server requires:
+- Qwen3-TTS model (auto-selects 1.7B or 0.6B based on VRAM)
+- OpenAI Whisper for auto-transcription
+
+## API Compatibility
+
+This plugin is designed as a drop-in replacement for `mr_eleven_stream`:
+- Same `speak` command interface
+- Same `stream_tts` service interface  
+- Same audio output format (ulaw 8kHz)
+- Same realtime streaming support via `partial_command` pipe
+
+The `voice_id` parameter is repurposed as a path to the reference audio file
+(instead of an ElevenLabs voice ID).
+
+## Latency
+
+| Scenario | Latency |
+|----------|--------|
+| First request (voice not cached) | ~500-1000ms (transcription + init) + ~100ms |
+| First request (voice cached on server) | ~100ms |
+| Subsequent requests | ~100ms |
+
+## Reference Audio Tips
+
+- **Duration**: 3-10 seconds works best
+- **Quality**: Clear speech, no background noise
+- **Content**: Natural conversational speech (not reading)
+- **Format**: WAV, MP3, or any format supported by soundfile

@@ -1,0 +1,40 @@
+{
+  "name": "mr_qwen3tts",
+  "version": "0.1.0",
+  "description": "Qwen3-TTS streaming TTS plugin - drop-in replacement for mr_eleven_stream",
+  "author": "MindRoot",
+  "dependencies": [
+    "websockets>=12.0"
+  ],
+  "services": [
+    "stream_tts"
+  ],
+  "commands": [
+    "speak"
+  ],
+  "pipes": [
+    "partial_command"
+  ],
+  "env_vars": {
+    "MR_QWEN3TTS_WS_URL": {
+      "description": "WebSocket URL for Qwen3-TTS server",
+      "default": "ws://localhost:8765"
+    },
+    "MR_QWEN3TTS_REF_AUDIO": {
+      "description": "Path to reference audio file for voice cloning",
+      "default": ""
+    },
+    "MR_QWEN3TTS_REF_TEXT": {
+      "description": "Transcript of reference audio",
+      "default": ""
+    },
+    "MR_QWEN3TTS_LANGUAGE": {
+      "description": "Language code for TTS",
+      "default": "Auto"
+    },
+    "MR_QWEN3TTS_REALTIME_STREAM": {
+      "description": "Enable realtime streaming mode",
+      "default": "0"
+    }
+  }
+}
