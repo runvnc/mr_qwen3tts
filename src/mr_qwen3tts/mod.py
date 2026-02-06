@@ -89,6 +89,9 @@ class Qwen3TTSClient:
         self._connection_id = 0
         self._created_at = time.time()
         
+        # Track whether previous generation completed cleanly
+        self._needs_drain = False
+        
         logger.info(f"Qwen3TTSClient created at {self._created_at}")
     
     async def connect(self):
@@ -100,7 +103,7 @@ class Qwen3TTSClient:
             try:
                 pong = await asyncio.wait_for(self._ws.ping(), timeout=2.0)
                 await pong
-                logger.info(f"REUSING connection {self._connection_id} (client created at {self._created_at})")
+                logger.debug(f"Reusing connection {self._connection_id}")
                 return
             except Exception as e:
                 logger.warning(f"Connection {self._connection_id} dead: {e}")
@@ -110,15 +113,16 @@ class Qwen3TTSClient:
                     pass
                 self._ws = None
                 self._voice_initialized = False
+                self._needs_drain = False
         
         # Create new connection
         self._connection_id += 1
-        logger.info(f"CREATING connection {self._connection_id} to {self.ws_url} (client created at {self._created_at})")
+        logger.info(f"Creating connection {self._connection_id} to {self.ws_url}")
         
         self._ws = await websockets.connect(
             self.ws_url,
             max_size=50 * 1024 * 1024,
-            ping_interval=20,  # Let websockets library handle pings
+            ping_interval=20,
             ping_timeout=20,
             close_timeout=10,
         )
@@ -130,6 +134,7 @@ class Qwen3TTSClient:
             logger.info(f"Connected {self._connection_id}, model: {data.get('model')}")
         
         self._voice_initialized = False
+        self._needs_drain = False
     
     async def disconnect(self):
         """Disconnect from the server."""
@@ -140,6 +145,57 @@ class Qwen3TTSClient:
                 pass
             self._ws = None
             self._voice_initialized = False
+            self._needs_drain = False
+    
+    async def _drain_pending(self):
+        """Drain any pending messages from a previous interrupted generation.
+        
+        Sends a cancel message and reads/discards messages until we get
+        audio_end or the buffer is empty (timeout). This ensures the
+        WebSocket is in a clean state before starting a new request.
+        """
+        if not self._needs_drain or not self._ws:
+            return
+        
+        logger.info("Draining pending messages from previous generation...")
+        
+        # Send cancel in case server is still generating
+        try:
+            await self._ws.send(json.dumps({"type": "cancel"}))
+        except Exception as e:
+            logger.warning(f"Failed to send cancel during drain: {e}")
+            self._needs_drain = False
+            return
+        
+        # Read and discard messages until audio_end or timeout
+        drained_count = 0
+        while True:
+            try:
+                msg = await asyncio.wait_for(self._ws.recv(), timeout=0.5)
+                drained_count += 1
+                
+                if isinstance(msg, bytes):
+                    continue  # Discard audio chunk
+                
+                data = json.loads(msg)
+                msg_type = data.get("type")
+                
+                if msg_type == "audio_end":
+                    logger.info(f"Drain complete: discarded {drained_count} messages (got audio_end)")
+                    break
+                elif msg_type == "error":
+                    logger.info(f"Drain complete: discarded {drained_count} messages (got error)")
+                    break
+                    
+            except asyncio.TimeoutError:
+                # No more pending messages
+                logger.info(f"Drain complete: discarded {drained_count} messages (buffer empty)")
+                break
+            except Exception as e:
+                logger.warning(f"Error during drain: {e}")
+                break
+        
+        self._needs_drain = False
     
     async def initialize_voice(
         self, 
@@ -217,6 +273,7 @@ class Qwen3TTSClient:
         async with self._lock:
             try:
                 await self.connect()
+                await self._drain_pending()
                 result = await self.initialize_voice(
                     audio_path=audio_path,
                     ref_text=ref_text,
@@ -252,50 +309,74 @@ class Qwen3TTSClient:
     ) -> AsyncGenerator[bytes, None]:
         """Generate audio and stream chunks."""
         t0 = time.time()
+        completed_cleanly = False
         
         async with self._lock:
-            logger.info(f"generate_stream starting (conn {self._connection_id}, client {self._created_at})")
+            logger.info(f"generate_stream starting (conn {self._connection_id})")
             
             await self.connect()
+            
+            # Drain any leftover messages from a previous interrupted generation
+            await self._drain_pending()
+            
             await self.ensure_voice_ready(audio_path=audio_path)
             
             language = language or self.language
             
-            # Send generate_stream request with reduced initial tokens
+            # Mark that we're starting a generation that needs draining if interrupted
+            self._needs_drain = True
+            
+            # Send generate_stream request
             await self._ws.send(json.dumps({
                 "type": "generate_stream",
                 "text": text,
                 "language": language,
                 "voice_id": self._voice_id,
-                "initial_chunk_tokens": INITIAL_CHUNK_TOKENS,  # Reduced from 8 to 4
+                "initial_chunk_tokens": INITIAL_CHUNK_TOKENS,
                 "stream_chunk_tokens": STREAM_CHUNK_TOKENS,
             }))
             
             chunk_count = 0
             first_chunk_time = None
             
-            while True:
-                try:
-                    msg = await asyncio.wait_for(self._ws.recv(), timeout=60.0)
-                except asyncio.TimeoutError:
-                    logger.error("Timeout waiting for audio")
-                    break
-                
-                if isinstance(msg, bytes):
-                    if first_chunk_time is None:
-                        first_chunk_time = time.time()
-                        logger.info(f"First audio in {(first_chunk_time-t0)*1000:.0f}ms")
-                    chunk_count += 1
-                    yield msg
-                else:
-                    data = json.loads(msg)
-                    msg_type = data.get("type")
-                    
-                    if msg_type == "audio_end":
-                        logger.info(f"Audio complete: {chunk_count} chunks in {(time.time()-t0)*1000:.0f}ms")
+            try:
+                while True:
+                    try:
+                        msg = await asyncio.wait_for(self._ws.recv(), timeout=60.0)
+                    except asyncio.TimeoutError:
+                        logger.error("Timeout waiting for audio")
                         break
-                    elif msg_type == "error":
-                        raise RuntimeError(f"Generation error: {data.get('message')}")
+                    
+                    if isinstance(msg, bytes):
+                        if first_chunk_time is None:
+                            first_chunk_time = time.time()
+                            logger.info(f"First audio in {(first_chunk_time-t0)*1000:.0f}ms")
+                        chunk_count += 1
+                        yield msg
+                    else:
+                        data = json.loads(msg)
+                        msg_type = data.get("type")
+                        
+                        if msg_type == "audio_end":
+                            logger.info(f"Audio complete: {chunk_count} chunks in {(time.time()-t0)*1000:.0f}ms")
+                            completed_cleanly = True
+                            break
+                        elif msg_type == "audio_start":
+                            continue
+                        elif msg_type == "error":
+                            logger.error(f"Generation error: {data.get('message')}")
+                            completed_cleanly = True  # No leftover audio to drain
+                            break
+            except GeneratorExit:
+                # Consumer stopped iterating (e.g., interrupted)
+                logger.info(f"generate_stream interrupted after {chunk_count} chunks")
+            finally:
+                if completed_cleanly:
+                    self._needs_drain = False
+                else:
+                    # Generation was interrupted - next call needs to drain
+                    self._needs_drain = True
+                    logger.info("Generation did not complete cleanly, will drain on next call")
     
     async def cancel(self):
         """Cancel current generation."""
