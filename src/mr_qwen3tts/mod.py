@@ -171,7 +171,7 @@ class Qwen3TTSClient:
         drained_count = 0
         while True:
             try:
-                msg = await asyncio.wait_for(self._ws.recv(), timeout=0.5)
+                msg = await asyncio.wait_for(self._ws.recv(), timeout=0.05)
                 drained_count += 1
                 
                 if isinstance(msg, bytes):
