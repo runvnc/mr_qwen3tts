@@ -15,6 +15,7 @@ from typing import AsyncGenerator, Optional, Dict, Any
 
 import dotenv
 dotenv.load_dotenv()
+import datetime
 
 from lib.providers.services import service, service_manager
 from lib.providers.commands import command
@@ -30,6 +31,16 @@ from .realtime_stream import (
 from .audio_pacer import AudioPacer
 
 logger = logging.getLogger(__name__)
+
+# Dedicated debug log for speak() tracing
+SPEAK_DEBUG_FILE = "/tmp/qwen3tts_speak_debug.log"
+
+def _speak_debug(msg):
+    """Write to dedicated speak debug log with timestamp."""
+    ts = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    line = f"{ts} | {msg}"
+    with open(SPEAK_DEBUG_FILE, 'a') as f:
+        f.write(line + "\n")
 
 # Configuration
 DEFAULT_WS_URL = os.environ.get('MR_QWEN3TTS_WS_URL', 'ws://localhost:8765')
@@ -534,6 +545,8 @@ async def speak(
         log_id = None
         if context and hasattr(context, 'log_id'):
             log_id = context.log_id
+
+        _speak_debug(f"speak() CALLED text='{text[:60]}...' log_id={log_id}")
         
         if log_id:
             if log_id not in _active_speak_locks:
@@ -542,6 +555,7 @@ async def speak(
             lock = _active_speak_locks[log_id]
             
             if lock.locked():
+                _speak_debug(f"speak() REJECTED - lock already held for {log_id}")
                 logger.warning(f"speak() already running for {log_id}")
                 return "ERROR: Speech already in progress."
             
@@ -555,6 +569,7 @@ async def speak(
             if session:
                 await session.finish()
                 await cleanup_session(log_id)
+            _speak_debug(f"speak() handled realtime session, returning")
             if log_id and log_id in _active_speak_locks and _active_speak_locks[log_id].locked():
                 _active_speak_locks[log_id].release()
             return None
@@ -578,11 +593,14 @@ async def speak(
             try:
                 is_halted = await service_manager.sip_is_audio_halted(context=context)
                 if is_halted:
+                    _speak_debug(f"speak() SKIPPED - sip_is_audio_halted=True text='{text[:60]}'")
                     logger.info("Audio halted, skipping speak")
                     return None
             except Exception:
                 pass
         
+        _speak_debug(f"speak() STARTING stream text='{text[:60]}' local={local_playback}")
+
         pacer = None
         if not local_playback:
             pacer = AudioPacer(sample_rate=8000)
@@ -609,9 +627,12 @@ async def speak(
                 local_audio_buffer += chunk
             else:
                 if pacer.interrupted:
+                    _speak_debug(f"speak() INTERRUPTED by pacer after {chunk_count} chunks")
                     break
                 await pacer.add_chunk(chunk)
         
+        _speak_debug(f"speak() stream done, {chunk_count} chunks, pacer.interrupted={pacer.interrupted if pacer else 'N/A'}")
+
         if not local_playback and pacer:
             pacer.mark_finished()
             
@@ -625,12 +646,15 @@ async def speak(
                 del _active_pacers[log_id]
             
             if pacer.interrupted and chunk_count < 2:
+                _speak_debug(f"speak() returning WARNING - interrupted with <2 chunks")
                 return "SYSTEM: WARNING - Command interrupted!\n\n"
         
+        _speak_debug(f"speak() COMPLETE text='{text[:60]}' chunks={chunk_count}")
         logger.info(f"Speech complete: {len(text)} chars, {chunk_count} chunks")
         return None
         
     except Exception as e:
+        _speak_debug(f"speak() EXCEPTION: {e}")
         logger.error(f"Error in speak: {e}")
         return None
 
@@ -639,6 +663,7 @@ async def speak(
             lock = _active_speak_locks[log_id]
             if lock.locked():
                 lock.release()
+        _speak_debug(f"speak() FINALLY - lock released for {log_id}")
 
 
 @hook()
@@ -656,6 +681,7 @@ async def on_interrupt(context=None):
         logger.debug("on_interrupt called without log_id")
         return
     
+    _speak_debug(f"on_interrupt FIRED log_id={log_id} pacer_active={log_id in _active_pacers}")
     # Cancel active pacer for this session
     if log_id in _active_pacers:
         pacer = _active_pacers[log_id]
