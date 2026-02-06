@@ -69,9 +69,6 @@ def _load_ref_audio_base64(audio_path: str) -> str:
 class Qwen3TTSClient:
     """WebSocket client for Qwen3-TTS server with persistent connection."""
     
-    _instance = None
-    _instance_lock = asyncio.Lock() if hasattr(asyncio, 'Lock') else None
-    
     def __init__(
         self,
         ws_url: str = DEFAULT_WS_URL,

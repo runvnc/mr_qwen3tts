@@ -2,6 +2,8 @@
 
 This module provides the ability to stream text to the TTS server as it comes in
 from the LLM, rather than waiting for complete sentences.
+
+Uses a persistent WebSocket connection that is reused across sessions.
 """
 
 import os
@@ -9,6 +11,7 @@ import asyncio
 import json
 import logging
 import base64
+import time
 from typing import Dict, Any, Optional
 from dataclasses import dataclass
 
@@ -62,11 +65,156 @@ async def _get_voice_path_from_context(context) -> Optional[str]:
     return None
 
 
+# --- Persistent WebSocket connection for realtime sessions ---
+
+class _PersistentRealtimeWS:
+    """Module-level persistent WebSocket connection for realtime TTS sessions.
+    
+    Maintains a single long-lived connection to the Qwen3-TTS server,
+    with cached voice initialization state so we don't re-init on every request.
+    """
+    
+    def __init__(self):
+        self._ws = None
+        self._ws_url = DEFAULT_WS_URL
+        self._lock = asyncio.Lock()
+        self._voice_initialized = False
+        self._voice_id: Optional[str] = None
+        self._current_voice_path: Optional[str] = None
+        self._connection_id = 0
+    
+    async def get_connection(self, voice_path: str = None, context=None):
+        """Get the persistent WebSocket, connecting and initializing voice if needed.
+        
+        Returns the raw websocket object for direct use by sessions.
+        """
+        async with self._lock:
+            await self._ensure_connected()
+            await self._ensure_voice_ready(voice_path, context)
+            return self._ws
+    
+    async def _ensure_connected(self):
+        """Ensure we have a live WebSocket connection."""
+        import websockets
+        
+        if self._ws is not None:
+            try:
+                pong = await asyncio.wait_for(self._ws.ping(), timeout=2.0)
+                await pong
+                logger.debug(f"Realtime WS: reusing connection {self._connection_id}")
+                return
+            except Exception as e:
+                logger.warning(f"Realtime WS: connection {self._connection_id} dead: {e}")
+                try:
+                    await self._ws.close()
+                except Exception:
+                    pass
+                self._ws = None
+                self._voice_initialized = False
+                self._voice_id = None
+        
+        # Create new connection
+        self._connection_id += 1
+        logger.info(f"Realtime WS: creating connection {self._connection_id} to {self._ws_url}")
+        
+        self._ws = await websockets.connect(
+            self._ws_url,
+            max_size=50 * 1024 * 1024,
+            ping_interval=20,
+            ping_timeout=20,
+            close_timeout=10,
+        )
+        
+        # Wait for connected message
+        msg = await asyncio.wait_for(self._ws.recv(), timeout=10.0)
+        data = json.loads(msg)
+        if data.get("type") == "connected":
+            logger.info(f"Realtime WS: connected {self._connection_id}, model: {data.get('model')}")
+        
+        self._voice_initialized = False
+        self._voice_id = None
+    
+    async def _ensure_voice_ready(self, voice_path: str = None, context=None):
+        """Ensure voice is initialized on the current connection."""
+        if not voice_path:
+            voice_path = await _get_voice_path_from_context(context)
+        if not voice_path:
+            voice_path = DEFAULT_REF_AUDIO
+        
+        # Already initialized with this voice on this connection
+        if self._voice_initialized and voice_path == self._current_voice_path:
+            logger.debug(f"Realtime WS: voice already initialized ({self._voice_id})")
+            return
+        
+        if not voice_path:
+            logger.error("Realtime WS: no reference audio available")
+            return
+        
+        # Try voice_id-only fast re-init if we have a cached ID
+        # (works if the server still has it in its voice cache)
+        if self._voice_id and voice_path == self._current_voice_path:
+            try:
+                await self._ws.send(json.dumps({
+                    "type": "init",
+                    "voice_id": self._voice_id,
+                }))
+                msg = await asyncio.wait_for(self._ws.recv(), timeout=10.0)
+                data = json.loads(msg)
+                if data.get("type") == "ready" and data.get("voice_loaded"):
+                    self._voice_initialized = True
+                    logger.info(f"Realtime WS: voice re-init from cache ({self._voice_id})")
+                    return
+            except Exception as e:
+                logger.warning(f"Realtime WS: voice_id re-init failed: {e}")
+        
+        # Full init with audio
+        ref_audio_b64 = _load_ref_audio_base64(voice_path)
+        if not ref_audio_b64:
+            logger.error(f"Realtime WS: could not load reference audio: {voice_path}")
+            return
+        
+        logger.info(f"Realtime WS: initializing voice from {voice_path}")
+        await self._ws.send(json.dumps({
+            "type": "init",
+            "ref_audio_base64": ref_audio_b64,
+            "ref_text": DEFAULT_REF_TEXT or "",
+            "auto_transcribe": True if not DEFAULT_REF_TEXT else False,
+            "x_vector_only": False,
+        }))
+        
+        msg = await asyncio.wait_for(self._ws.recv(), timeout=30.0)
+        data = json.loads(msg)
+        if data.get("type") == "ready" and data.get("voice_loaded"):
+            self._voice_initialized = True
+            self._voice_id = data.get("voice_id")
+            self._current_voice_path = voice_path
+            logger.info(f"Realtime WS: voice ready (id={self._voice_id}, cached={data.get('cached')})")
+        else:
+            logger.error(f"Realtime WS: voice init failed: {data}")
+    
+    async def close(self):
+        """Explicitly close the connection (e.g. on shutdown)."""
+        if self._ws:
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
+            self._ws = None
+            self._voice_initialized = False
+
+
+# Module-level singleton
+_persistent_ws = _PersistentRealtimeWS()
+
+
 class RealtimeSpeakSession:
     """Manages a realtime streaming TTS session.
     
     Tracks text deltas and streams them to the Qwen3-TTS server,
     while simultaneously streaming audio output to SIP or local playback.
+    
+    Uses the module-level persistent WebSocket connection instead of
+    creating/destroying connections per session.
     """
     
     def __init__(self, context: Any):
@@ -81,9 +229,8 @@ class RealtimeSpeakSession:
         self._text_buffer = ""
         self._pending_text = ""
         
-        # WebSocket connection
+        # Reference to the shared WebSocket (set during start)
         self._ws = None
-        self._ws_url = DEFAULT_WS_URL
         
         # Audio processing
         self._pacer: Optional[AudioPacer] = None
@@ -91,53 +238,6 @@ class RealtimeSpeakSession:
         
         # Synchronization
         self._generation_complete = asyncio.Event()
-    
-    async def _connect(self):
-        """Connect to the WebSocket server."""
-        import websockets
-        
-        if self._ws is not None:
-            return
-        
-        logger.info(f"Connecting to Qwen3-TTS server at {self._ws_url}")
-        self._ws = await websockets.connect(
-            self._ws_url,
-            max_size=50 * 1024 * 1024,
-            ping_interval=10,
-            ping_timeout=10,
-        )
-        
-        # Wait for connected message
-        msg = await self._ws.recv()
-        data = json.loads(msg)
-        if data.get("type") == "connected":
-            logger.info(f"Connected to server")
-        
-
-        # Server keeps voice_prompt per-connection session.
-        # Realtime mode MUST init a voice on this websocket before sending generate.
-        voice_path = await _get_voice_path_from_context(self.context)
-        if not voice_path:
-            voice_path = DEFAULT_REF_AUDIO
-        ref_audio_b64 = _load_ref_audio_base64(voice_path) if voice_path else ""
-        if not ref_audio_b64:
-            logger.error("RealtimeSpeakSession: No reference audio available (set persona.voice_id or MR_QWEN3TTS_REF_AUDIO)")
-            return
-
-        await self._ws.send(json.dumps({
-            "type": "init",
-            "ref_audio_base64": ref_audio_b64,
-            "ref_text": DEFAULT_REF_TEXT or "",
-            "auto_transcribe": True if not DEFAULT_REF_TEXT else False,
-            "x_vector_only": False,
-        }))
-
-        ready_msg = await self._ws.recv()
-        ready = json.loads(ready_msg)
-        if ready.get("type") != "ready" or not ready.get("voice_loaded"):
-            logger.error(f"RealtimeSpeakSession: voice init failed: {ready}")
-        else:
-            logger.info(f"RealtimeSpeakSession: voice ready (voice_id={ready.get('voice_id')}, cached={ready.get('cached')})")
     
     async def _process_audio(self):
         """Async task that receives audio from WebSocket and sends to SIP."""
@@ -221,9 +321,14 @@ class RealtimeSpeakSession:
         self._text_buffer = ""
         self._generation_complete.clear()
         
-        await self._connect()
+        # Get the persistent shared WebSocket (connects + inits voice if needed)
+        voice_path = await _get_voice_path_from_context(self.context)
+        self._ws = await _persistent_ws.get_connection(
+            voice_path=voice_path, 
+            context=self.context
+        )
         
-        debug_log(f"RealtimeSpeakSession.start: Session started")
+        debug_log(f"RealtimeSpeakSession.start: Session started (conn {_persistent_ws._connection_id})")
         logger.info("Started realtime TTS session")
     
     async def feed_text(self, delta: str):
@@ -249,6 +354,7 @@ class RealtimeSpeakSession:
                 "type": "generate_stream",
                 "text": self._text_buffer,
                 "language": "Auto",
+                "voice_id": _persistent_ws._voice_id,
                 "initial_chunk_tokens": 8,
                 "stream_chunk_tokens": 8,
             }))
@@ -266,10 +372,9 @@ class RealtimeSpeakSession:
         # Finalize pacer
         await self._finalize_pacer()
         
-        # Close WebSocket
-        if self._ws:
-            await self._ws.close()
-            self._ws = None
+        # NOTE: We do NOT close the WebSocket here anymore.
+        # The persistent connection stays open for reuse.
+        self._ws = None  # Release our reference (connection stays alive in _persistent_ws)
         
         self.is_active = False
         logger.info("Realtime TTS session finished")
@@ -299,10 +404,8 @@ class RealtimeSpeakSession:
             except asyncio.CancelledError:
                 pass
         
-        # Close WebSocket
-        if self._ws:
-            await self._ws.close()
-            self._ws = None
+        # NOTE: We do NOT close the WebSocket here anymore.
+        self._ws = None
         
         logger.info("Realtime TTS session cancelled")
 
