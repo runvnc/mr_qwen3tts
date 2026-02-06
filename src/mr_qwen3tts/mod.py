@@ -124,8 +124,8 @@ class Qwen3TTSClient:
         self._ws = await websockets.connect(
             self.ws_url,
             max_size=50 * 1024 * 1024,
-            ping_interval=20,
-            ping_timeout=20,
+            ping_interval=None,
+            ping_timeout=None,
             close_timeout=10,
         )
         
