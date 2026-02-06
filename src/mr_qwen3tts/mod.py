@@ -46,6 +46,8 @@ _active_speak_locks: Dict[str, asyncio.Lock] = {}
 
 # Track warmed up voices by path
 _warmed_voices: Dict[str, str] = {}  # path -> voice_id
+# Track active AudioPacer instances per log_id (for interrupt support)
+_active_pacers: Dict[str, Any] = {}
 
 
 def _get_local_playback_enabled() -> bool:
@@ -585,6 +587,10 @@ async def speak(
         if not local_playback:
             pacer = AudioPacer(sample_rate=8000)
             
+            # Track this pacer for interrupt support
+            if log_id:
+                _active_pacers[log_id] = pacer
+            
             async def send_to_sip(chunk, timestamp=None, context=None):
                 try:
                     return await service_manager.sip_audio_out_chunk(chunk, timestamp=timestamp, context=context)
@@ -614,6 +620,10 @@ async def speak(
             
             await pacer.stop()
             
+            # Remove from active pacers
+            if log_id and log_id in _active_pacers:
+                del _active_pacers[log_id]
+            
             if pacer.interrupted and chunk_count < 2:
                 return "SYSTEM: WARNING - Command interrupted!\n\n"
         
@@ -629,3 +639,30 @@ async def speak(
             lock = _active_speak_locks[log_id]
             if lock.locked():
                 lock.release()
+
+
+@hook()
+async def on_interrupt(context=None):
+    """Handle interruption signal from the system.
+    
+    Called when the user interrupts the AI (e.g., starts speaking during TTS).
+    Cancels any active TTS streams for the current session.
+    """
+    log_id = None
+    if context and hasattr(context, 'log_id'):
+        log_id = context.log_id
+    
+    if not log_id:
+        logger.debug("on_interrupt called without log_id")
+        return
+    
+    # Cancel active pacer for this session
+    if log_id in _active_pacers:
+        pacer = _active_pacers[log_id]
+        logger.info(f"on_interrupt: Interrupting TTS stream for session {log_id}")
+        pacer.interrupt()
+    
+    # Also cleanup any realtime streaming session
+    if is_realtime_streaming_enabled() and has_active_session(log_id):
+        logger.info(f"on_interrupt: Cleaning up realtime session for {log_id}")
+        await cleanup_session(log_id)
