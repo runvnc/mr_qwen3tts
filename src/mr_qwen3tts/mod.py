@@ -107,6 +107,30 @@ class Qwen3TTSClient:
         
         logger.info(f"Qwen3TTSClient created at {self._created_at}")
     
+    async def force_reconnect(self):
+        """Force disconnect and reconnect with voice re-init.
+        
+        Used after interruptions to ensure a fresh connection.
+        """
+        _speak_debug("force_reconnect: starting")
+        async with self._lock:
+            try:
+                await self.disconnect()
+                await self.connect()
+                # Re-init voice if we had one
+                if self._current_audio_path:
+                    await self.initialize_voice(audio_path=self._current_audio_path)
+                _speak_debug(f"force_reconnect: done, conn={self._connection_id}")
+            except Exception as e:
+                _speak_debug(f"force_reconnect: error: {e}")
+                logger.error(f"Error during force_reconnect: {e}")
+    
+    def schedule_reconnect(self):
+        """Schedule a background reconnect (non-blocking)."""
+        _speak_debug("schedule_reconnect: scheduling background reconnect")
+        self._needs_drain = False  # Fresh connection won't need drain
+        asyncio.create_task(self.force_reconnect())
+    
     async def connect(self):
         """Connect to the WebSocket server."""
         import websockets
@@ -644,6 +668,12 @@ async def speak(
             # Remove from active pacers
             if log_id and log_id in _active_pacers:
                 del _active_pacers[log_id]
+            
+            # After interruption, force reconnect in background so next speak()
+            # gets a fresh connection instead of a potentially dying one
+            if pacer.interrupted:
+                client = await get_client()
+                client.schedule_reconnect()
             
             if pacer.interrupted and chunk_count < 2:
                 _speak_debug(f"speak() returning WARNING - interrupted with <2 chunks")
