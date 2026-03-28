@@ -33,6 +33,9 @@ logger = logging.getLogger(__name__)
 API_URL = os.environ.get('MR_QWEN3TTS_API_URL', 'http://localhost:8091')
 VOICE = os.environ.get('MR_QWEN3TTS_VOICE', 'vivian')
 LANGUAGE = os.environ.get('MR_QWEN3TTS_LANGUAGE', 'Auto')
+BASE_MODEL = os.environ.get('MR_QWEN3TTS_MODEL', 'Qwen/Qwen3-TTS-12Hz-1.7B-Base')
+REF_AUDIO = os.environ.get('MR_QWEN3TTS_REF_AUDIO', '')
+REF_TEXT = os.environ.get('MR_QWEN3TTS_REF_TEXT', '')
 
 # PCM conversion state (audioop.ratecv is stateful)
 _RESAMPLE_STATE = None
@@ -80,11 +83,32 @@ async def _stream_tts_http(
     url = f"{API_URL.rstrip('/')}/v1/audio/speech"
     payload = {
         "input": text,
-        "voice": voice or VOICE,
+        "model": BASE_MODEL,
+        "task_type": "Base",
         "language": language or LANGUAGE,
         "stream": True,
         "response_format": "pcm",
     }
+
+    voice = voice or VOICE
+    
+    ref_audio = REF_AUDIO
+    ref_text = REF_TEXT
+
+    # If voice_id is a URL, use it as ref_audio
+    if voice and (voice.startswith('http://') or voice.startswith('https://')):
+        ref_audio = voice
+        ref_text = ""
+    elif voice and os.path.isabs(voice) and os.path.exists(voice):
+        logger.warning(f"Local ref_audio not supported for HTTP API: {voice}. Use a URL.")
+
+    if not ref_audio:
+        logger.error("No ref_audio set! Set MR_QWEN3TTS_REF_AUDIO to a URL to a WAV file.")
+        return
+
+    payload["ref_audio"] = ref_audio
+    payload["ref_text"] = ref_text
+    payload["x_vector_only_mode"] = not bool(ref_text)
 
     resample_state = None
     ulaw_buffer = b''
