@@ -109,6 +109,9 @@ async def _stream_tts_http(
     payload["ref_audio"] = ref_audio
     payload["ref_text"] = ref_text
     payload["x_vector_only_mode"] = not bool(ref_text)
+    # Emit first audio chunk after only 2 codec frames instead of default 25.
+    # Benchmark: 8x TTFA reduction (1851ms -> ~233ms). See vllm-omni PR #1583.
+    payload["initial_codec_chunk_frames"] = 2
 
     resample_state = None
     ulaw_buffer = b''
