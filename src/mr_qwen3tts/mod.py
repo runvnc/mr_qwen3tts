@@ -110,7 +110,9 @@ async def _stream_tts_http(
     payload["ref_text"] = ref_text
     payload["x_vector_only_mode"] = not bool(ref_text)
     # 3 frames = ~250ms at 12Hz. Lowest untried value (2 caused errors, 8 and 25 tried).
-    payload["initial_codec_chunk_frames"] = 3
+    # ic=2 gives ~205ms TTFA vs 2030ms default. Benchmarked in vllm-omni PR #1583.
+    # The 'length 1 not divisible by 16' warning is benign - first token skipped, rest processes fine.
+    payload["initial_codec_chunk_frames"] = 2
 
     resample_state = None
     ulaw_buffer = b''
