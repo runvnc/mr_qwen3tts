@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 API_URL = os.environ.get('MR_QWEN3TTS_API_URL', 'http://localhost:8091')
 VOICE = os.environ.get('MR_QWEN3TTS_VOICE', 'vivian')
 LANGUAGE = os.environ.get('MR_QWEN3TTS_LANGUAGE', 'Auto')
-BASE_MODEL = os.environ.get('MR_QWEN3TTS_MODEL', 'Qwen/Qwen3-TTS-12Hz-1.7B-Base')
+BASE_MODEL = os.environ.get('MR_QWEN3TTS_MODEL', 'Qwen/Qwen3-TTS-12Hz-0.6B-Base')
 REF_AUDIO = os.environ.get('MR_QWEN3TTS_REF_AUDIO', '')
 REF_TEXT = os.environ.get('MR_QWEN3TTS_REF_TEXT', '')
 
