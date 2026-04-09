@@ -4,12 +4,13 @@ Qwen3-TTS streaming TTS plugin for MindRoot - drop-in replacement for `mr_eleven
 
 ## Overview
 
-This plugin connects to a remote Qwen3-TTS WebSocket server to provide:
-- Voice cloning from reference audio (3-10 seconds)
-- **Auto-transcription** using Whisper (no manual transcript needed)
-- Streaming audio output (ulaw 8kHz for SIP/telephony)
-- Realtime text streaming support
-- **Automatic voice cache warmup** for zero-latency first requests
+This plugin provides text-to-speech using Qwen3-TTS with multiple backend options:
+
+- **openai (default)** - groxaxo OpenAI-FastAPI server - lowest latency (~97ms TTFA), recommended for production
+- **websocket** - custom Qwen3-TTS WebSocket server - voice cloning with auto-transcription
+- **vllm** - vllm-omni HTTP API - integrated with vLLM inference engine
+
+All backends output streaming ulaw 8kHz audio suitable for SIP/telephony.
 
 ## Installation
 
@@ -17,7 +18,77 @@ This plugin connects to a remote Qwen3-TTS WebSocket server to provide:
 pip install -e .
 ```
 
-## Voice Configuration
+## Backend Configuration
+
+Set `MR_QWEN3TTS_BACKEND` to select the implementation:
+
+```bash
+# Default: groxaxo OpenAI-FastAPI (recommended, lowest latency)
+MR_QWEN3TTS_BACKEND=openai
+MR_QWEN3TTS_OPENAI_URL=http://localhost:8880
+MR_QWEN3TTS_VOICE=Vivian
+
+# Alternative: WebSocket server
+MR_QWEN3TTS_BACKEND=websocket
+MR_QWEN3TTS_WS_URL=ws://localhost:8765
+
+# Alternative: vllm-omni
+MR_QWEN3TTS_BACKEND=vllm
+```
+
+## Voice Configuration (OpenAI Backend)
+
+### Built-in Voices
+
+The groxaxo server includes built-in voices like `Vivian`, `Ethan`, etc.
+
+### Voice Library (Recommended for Production)
+
+Register voice profiles on the server, then use `clone:VoiceName`:
+
+```bash
+MR_QWEN3TTS_VOICE=clone:Alice
+```
+
+The server caches speaker embeddings, saving ~0.7s per repeated clone request.
+
+### Auto-Registration from URL (Recommended)
+
+Set `voice_id` to a URL pointing to a reference audio file. The plugin will automatically:
+
+1. Register the voice with the groxaxo server on first use
+2. Cache the URL -> `clone:Name` mapping locally
+3. Use `clone:Name` for all subsequent requests (no re-registration)
+
+```json
+{
+  "name": "MyAgent",
+  "persona": {
+    "voice_id": "https://example.com/agent_voices/alice.wav"
+  }
+}
+```
+
+The first utterance from a new voice has ~1-2s overhead for registration.
+All subsequent utterances use the cached profile with no overhead.
+
+This requires the groxaxo server to be running with the voice registration
+router mounted (the `run_groxaxo.py` wrapper handles this automatically).
+
+### Per-Agent Voice
+
+Set `voice_id` in the agent's persona:
+
+```json
+{
+  "name": "MyAgent",
+  "persona": {
+    "voice_id": "clone:Alice"
+  }
+}
+```
+
+## Voice Configuration (WebSocket Backend)
 
 ### Option 1: Per-Agent Voice (Recommended)
 
@@ -43,40 +114,26 @@ MR_QWEN3TTS_REF_AUDIO=/path/to/default_voice.wav
 MR_QWEN3TTS_REF_TEXT="Optional transcript"  # Will auto-transcribe if not set
 ```
 
-### Option 3: Per-Request Voice
-
-Pass the audio path as `voice_id` in the command:
-
-```json
-{ "speak": { "text": "Hello", "voice_id": "/path/to/voice.wav" } }
-```
-
 ## Environment Variables
 
 ```bash
-# Required: WebSocket server URL
-MR_QWEN3TTS_WS_URL=ws://your-server:8765
+# Backend selection
+MR_QWEN3TTS_BACKEND=openai          # openai (default) | websocket | vllm
 
-# Optional: Default voice (fallback if no persona voice_id)
+# OpenAI backend settings
+MR_QWEN3TTS_OPENAI_URL=http://localhost:8880  # groxaxo server URL
+MR_QWEN3TTS_VOICE=Vivian            # Default voice name
+MR_QWEN3TTS_MODEL=qwen3-tts         # Model name for API
+
+# WebSocket backend settings
+MR_QWEN3TTS_WS_URL=ws://localhost:8765
 MR_QWEN3TTS_REF_AUDIO=/path/to/default_voice.wav
 MR_QWEN3TTS_REF_TEXT="Optional transcript"
 
-# Optional: Language setting
-MR_QWEN3TTS_LANGUAGE=Auto
-
-# Optional: Enable realtime streaming
-MR_QWEN3TTS_REALTIME_STREAM=1
+# Common settings
+MR_QWEN3TTS_LANGUAGE=Auto           # Auto, Chinese, English, Japanese, Korean, etc.
+MR_QWEN3TTS_REALTIME_STREAM=1        # Enable realtime streaming
 ```
-
-## Voice Cache
-
-Voices are cached on the server indefinitely:
-
-1. **First request** for a voice: ~500-1000ms (transcription + voice init)
-2. **Subsequent requests**: ~100ms (generation only)
-
-The plugin also caches voice IDs locally, so reconnecting to the server
-with the same audio file will hit the server cache.
 
 ## Usage
 
@@ -96,13 +153,34 @@ async for chunk in service_manager.stream_tts(text="Hello world", context=contex
     await send_to_sip(chunk)
 ```
 
-## Server Setup
+## Container Setup
 
-See `/files/qwen3tts` for the WebSocket server.
+The RunPod container supports multiple TTS backends via `TTS_BACKEND` env var:
 
-The server requires:
-- Qwen3-TTS model (auto-selects 1.7B or 0.6B based on VRAM)
-- OpenAI Whisper for auto-transcription
+```bash
+# Default: groxaxo OpenAI-FastAPI (lowest latency)
+TTS_BACKEND=qwen3tts_openai
+
+# Alternative: vllm-omni
+TTS_BACKEND=qwen3tts
+
+# Alternative: Custom WebSocket server
+TTS_BACKEND=qwen3tts_custom
+
+# Alternative: CosyVoice3
+TTS_BACKEND=cosyvoice3
+```
+
+## Latency Comparison
+
+| Backend | TTFA | RTF | Notes |
+|--------|------|-----|-------|
+| openai (groxaxo) | ~97ms | 0.65-0.70 | Optimized backend with torch.compile + CUDA graphs |
+| vllm-omni | ~205ms | ~0.83 | Integrated with vLLM |
+| websocket | ~100ms+ | varies | Custom server, voice cache helps |
+
+Note: First 2-3 requests with the openai backend are slow (~10-30s) during torch.compile warmup.
+Set `TTS_WARMUP_ON_START=true` to warm up at container start.
 
 ## API Compatibility
 
@@ -112,20 +190,14 @@ This plugin is designed as a drop-in replacement for `mr_eleven_stream`:
 - Same audio output format (ulaw 8kHz)
 - Same realtime streaming support via `partial_command` pipe
 
-The `voice_id` parameter is repurposed as a path to the reference audio file
-(instead of an ElevenLabs voice ID).
+## GPU Memory (H200)
 
-## Latency
+| Component | Memory |
+|-----------|--------|
+| LLM (Qwen3.5-35B-A3B) | ~122 GiB |
+| Qwen3-TTS 0.6B | ~4 GiB |
+| Qwen3-TTS 1.7B | ~8 GiB |
+| Free buffer | ~5-21 GiB |
 
-| Scenario | Latency |
-|----------|--------|
-| First request (voice not cached) | ~500-1000ms (transcription + init) + ~100ms |
-| First request (voice cached on server) | ~100ms |
-| Subsequent requests | ~100ms |
-
-## Reference Audio Tips
-
-- **Duration**: 3-10 seconds works best
-- **Quality**: Clear speech, no background noise
-- **Content**: Natural conversational speech (not reading)
-- **Format**: WAV, MP3, or any format supported by soundfile
+The groxaxo server manages its own GPU memory via PyTorch/transformers (not vllm),
+so no `gpu_memory_utilization` setting is needed.
