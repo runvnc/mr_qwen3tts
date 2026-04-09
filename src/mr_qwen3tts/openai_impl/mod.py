@@ -219,6 +219,7 @@ async def _stream_tts_openai(
 
     resample_state = None
     ulaw_buffer = b''
+    pcm_align_buffer = b''  # Ensure even-length PCM for audioop (16-bit samples)
     CHUNK_SIZE = 160  # 20ms at 8kHz ulaw
     t0 = time.time()
     first_chunk_logged = False
@@ -236,6 +237,14 @@ async def _stream_tts_openai(
                 if not pcm_chunk:
                     continue
 
+                # Ensure PCM is even-length (complete 16-bit samples for audioop)
+                pcm_chunk = pcm_align_buffer + pcm_chunk
+                if len(pcm_chunk) % 2 != 0:
+                    pcm_align_buffer = pcm_chunk[-1:]
+                    pcm_chunk = pcm_chunk[:-1]
+                else:
+                    pcm_align_buffer = b''
+
                 if not first_chunk_logged:
                     logger.info(f"First PCM chunk in {(time.time()-t0)*1000:.0f}ms")
                     first_chunk_logged = True
@@ -248,6 +257,10 @@ async def _stream_tts_openai(
                 while len(ulaw_buffer) >= CHUNK_SIZE:
                     yield ulaw_buffer[:CHUNK_SIZE]
                     ulaw_buffer = ulaw_buffer[CHUNK_SIZE:]
+
+    # Flush any remaining PCM alignment bytes (shouldn't normally happen)
+    if pcm_align_buffer:
+        logger.debug(f"Discarding {len(pcm_align_buffer)} trailing PCM byte")
 
     # Flush any remaining audio
     if ulaw_buffer:

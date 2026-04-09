@@ -1,16 +1,21 @@
 """Audio pacing for proper timing of TTS output to SIP.
 
 Adapted from mr_eleven_stream with interrupt support.
+Pre-buffer support for jitter absorption.
 """
 
 import asyncio
 import logging
+import os
 import time
 from collections import deque
 from typing import Callable, Optional, Any
 
 logger = logging.getLogger(__name__)
 
+
+# Default pre-buffer: 60ms of audio before starting playback (absorbs HTTP chunked jitter)
+DEFAULT_PRE_BUFFER_MS = int(os.environ.get('MR_QWEN3TTS_PRE_BUFFER_MS', '60'))
 
 class AudioPacer:
     """Paces audio chunks to real-time speed with small buffer.
@@ -19,12 +24,16 @@ class AudioPacer:
     with precise timestamps for proper playback timing.
     """
 
-    def __init__(self, sample_rate: int = 8000):
+    def __init__(self, sample_rate: int = 8000, pre_buffer_ms: int = None):
         """
         Args:
             sample_rate: Audio sample rate in Hz (default 8000 for ulaw telephony)
+            pre_buffer_ms: Milliseconds of audio to buffer before starting playback.
+                           Absorbs network jitter from HTTP chunked transfer.
+                           Default: 60ms (env: MR_QWEN3TTS_PRE_BUFFER_MS)
         """
         self.sample_rate = sample_rate
+        self.pre_buffer_ms = pre_buffer_ms if pre_buffer_ms is not None else DEFAULT_PRE_BUFFER_MS
         self.buffer = deque()
         self.pacer_task: Optional[asyncio.Task] = None
         self.on_audio_chunk: Optional[Callable] = None
@@ -37,14 +46,26 @@ class AudioPacer:
         self.audio_start_time: Optional[float] = None
         self._finished_adding = False
         self._interrupted = False
+        
+        # Pre-buffer state
+        self._pre_buffering = True
+        self._pre_buffer_bytes = int(self.sample_rate * self.pre_buffer_ms / 1000)
+        self._pre_buffer_accumulated = 0
+        self._underrun_count = 0
 
     async def add_chunk(self, audio_bytes: bytes):
         """Add audio chunk to buffer."""
         if self._running:
             self.buffer.append(audio_bytes)
             
-            if self.audio_start_time is None:
-                self.audio_start_time = time.perf_counter()
+            # Accumulate pre-buffer before we start playing
+            if self._pre_buffering:
+                self._pre_buffer_accumulated += len(audio_bytes)
+                if self._pre_buffer_accumulated >= self._pre_buffer_bytes:
+                    self._pre_buffering = False
+                    self.audio_start_time = time.perf_counter()
+                    logger.info(f"AudioPacer: pre-buffer full ({self._pre_buffer_accumulated} bytes, "
+                                f"{self._pre_buffer_accumulated/self.sample_rate*1000:.0f}ms), starting playback")
 
     @property
     def interrupted(self) -> bool:
@@ -71,6 +92,9 @@ class AudioPacer:
         self.audio_start_time = None
         self.bytes_sent = 0
         self.start_time = time.perf_counter()
+        self._pre_buffering = True
+        self._pre_buffer_accumulated = 0
+        self._underrun_count = 0
         self._interrupted = False
         self._finished_adding = False
         logger.debug("AudioPacer cleared and reset")
@@ -91,6 +115,9 @@ class AudioPacer:
         self.start_time = time.perf_counter()
         self.bytes_sent = 0
         self.audio_start_time = None
+        self._pre_buffering = True
+        self._pre_buffer_accumulated = 0
+        self._underrun_count = 0
         
         self.pacer_task = asyncio.create_task(self._pace_loop())
 
@@ -99,7 +126,12 @@ class AudioPacer:
         while self._running:
             if self._interrupted:
                 break
-            
+
+            # During pre-buffering, wait for buffer to fill before sending
+            if self._pre_buffering:
+                await asyncio.sleep(0.005)
+                continue
+
             if len(self.buffer) > 0:
                 chunk = self.buffer.popleft()
                 
@@ -130,13 +162,26 @@ class AudioPacer:
                 
                 if sleep_duration > 0:
                     await asyncio.sleep(sleep_duration)
-                
+                else:
+                    # We're behind - potential underrun just happened or is about to
+                    self._underrun_count += 1
+                    if self._underrun_count <= 3:
+                        logger.warning(f"AudioPacer: underrun #{self._underrun_count}, "
+                                      f"{self.bytes_sent} bytes sent, buffer={len(self.buffer)}")
+                    # Small yield to prevent busy-loop when catching up
+                    await asyncio.sleep(0)
+                    
             else:
                 if self._finished_adding:
                     break
-                await asyncio.sleep(0.005)
+                # Buffer empty but not finished - short sleep
+                self._underrun_count += 1
+                if self._underrun_count <= 3:
+                    logger.warning(f"AudioPacer: buffer empty (underrun #{self._underrun_count})")
+                await asyncio.sleep(0.001)
         
-        logger.debug(f"AudioPacer: finished, sent {self.bytes_sent} bytes")
+        logger.info(f"AudioPacer: finished, sent {self.bytes_sent} bytes, "
+                    f"underruns={self._underrun_count}")
 
     async def stop(self):
         """Stop pacing and clear buffer."""
