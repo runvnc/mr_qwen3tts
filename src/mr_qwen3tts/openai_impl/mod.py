@@ -116,7 +116,7 @@ async def _register_voice_url(voice_url: str, name: str = None) -> str:
             "ref_audio_url": voice_url,
             "ref_text": REF_TEXT or None,
             "language": LANGUAGE,
-            "x_vector_only_mode": not bool(REF_TEXT),  # Use x-vector mode if no ref_text
+            "x_vector_only_mode": False,  # ICL mode - server auto-transcribes with Whisper for best quality
         }
 
         logger.info(f"Auto-registering voice from URL: {voice_url} -> clone:{name}")
