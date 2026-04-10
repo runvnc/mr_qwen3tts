@@ -320,7 +320,31 @@ async def speak(
                 return "ERROR: Speech already in progress."
             await lock.acquire()
 
-        voice = voice_id or VOICE
+        # Resolve voice: explicit arg > persona voice_id > env var default
+        voice = voice_id
+        if not voice and context and hasattr(context, 'agent_name'):
+            try:
+                agent_data = await service_manager.get_agent_data(context.agent_name)
+                persona = agent_data.get("persona", {})
+                persona_voice = persona.get("voice_id", "")
+                if persona_voice:
+                    voice = persona_voice
+                    _speak_debug(f"speak() using persona voice_id='{persona_voice}'")
+                    logger.info(f"speak(): using persona voice_id='{persona_voice}'")
+            except Exception as e:
+                logger.warning(f"speak(): could not get persona voice_id: {e}")
+        if not voice:
+            voice = VOICE
+
+        # Guard: if voice is not a URL and not a clone: profile, refuse to speak
+        # (prevents silently falling back to a built-in voice when clone is expected)
+        is_clone = voice.startswith('clone:') or _is_voice_url(voice)
+        if not is_clone:
+            err = f"ERROR: No voice clone configured. voice='{voice}' is a built-in voice name. Set persona voice_id to a URL or clone:Name."
+            logger.error(err)
+            _speak_debug(err)
+            return err
+
         local_playback = _get_local_playback_enabled()
 
         if not local_playback:
