@@ -14,8 +14,8 @@ from typing import Callable, Optional, Any
 logger = logging.getLogger(__name__)
 
 
-# Default pre-buffer: 60ms of audio before starting playback (absorbs HTTP chunked jitter)
-DEFAULT_PRE_BUFFER_MS = int(os.environ.get('MR_QWEN3TTS_PRE_BUFFER_MS', '60'))
+# Default pre-buffer: 40ms of audio before starting playback (absorbs HTTP chunked jitter)
+DEFAULT_PRE_BUFFER_MS = int(os.environ.get('MR_QWEN3TTS_PRE_BUFFER_MS', '40'))
 
 class AudioPacer:
     """Paces audio chunks to real-time speed with small buffer.
