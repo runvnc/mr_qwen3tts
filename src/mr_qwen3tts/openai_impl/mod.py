@@ -57,6 +57,14 @@ MODEL = os.environ.get('MR_QWEN3TTS_MODEL', 'qwen3-tts')
 REF_AUDIO = os.environ.get('MR_QWEN3TTS_REF_AUDIO', '')
 REF_TEXT = os.environ.get('MR_QWEN3TTS_REF_TEXT', '')
 
+# Qwen speak() already paces chunks before handing them to SIP.
+# For live RTP, forwarding absolute timestamps can trigger PySIP catch-up bursts
+# when the final sender sees frames as late, which Linphone may render as
+# flutter/fast-echo artifacts. Default off for Qwen only; ElevenLabs is untouched.
+SEND_TIMESTAMPS = os.environ.get(
+    'MR_QWEN3TTS_SEND_TIMESTAMPS', '0'
+).lower() in ('1', 'true', 'yes', 'on')
+
 # Per-session speak() locks
 _active_speak_locks: Dict[str, asyncio.Lock] = {}
 # Active AudioPacer instances per log_id (for interrupt support)
@@ -376,7 +384,8 @@ async def speak(
 
             async def send_to_sip(chunk, timestamp=None, context=None):
                 try:
-                    return await service_manager.sip_audio_out_chunk(chunk, timestamp=timestamp, context=context)
+                    send_ts = timestamp if SEND_TIMESTAMPS else None
+                    return await service_manager.sip_audio_out_chunk(chunk, timestamp=send_ts, context=context)
                 except Exception as e:
                     logger.error(f"Error sending to SIP: {e}")
                     return False
