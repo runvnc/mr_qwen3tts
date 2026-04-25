@@ -19,6 +19,7 @@ from typing import AsyncGenerator, Optional, Dict, Any
 import dotenv
 dotenv.load_dotenv()
 
+import socket
 import httpx
 
 from lib.providers.services import service, service_manager
@@ -46,6 +47,12 @@ def _speak_debug(msg):
 API_URL = os.environ.get('MR_QWEN3TTS_OPENAI_URL', 'http://localhost:8880')
 VOICE = os.environ.get('MR_QWEN3TTS_VOICE', 'Vivian')
 LANGUAGE = os.environ.get('MR_QWEN3TTS_LANGUAGE', 'Auto')
+
+# TCP_NODELAY socket option tuple: (IPPROTO_TCP, TCP_NODELAY, 1)
+# Disables Nagle's algorithm to avoid up to 40ms buffering delay on small writes.
+# Critical for streaming audio chunks on localhost.
+_TCP_NODELAY_OPT = (socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
 MODEL = os.environ.get('MR_QWEN3TTS_MODEL', 'qwen3-tts')
 REF_AUDIO = os.environ.get('MR_QWEN3TTS_REF_AUDIO', '')
 REF_TEXT = os.environ.get('MR_QWEN3TTS_REF_TEXT', '')
@@ -124,7 +131,8 @@ async def _register_voice_url(voice_url: str, name: str = None) -> str:
 
         try:
             async with httpx.AsyncClient(
-                timeout=httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=10.0)
+                timeout=httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=10.0),
+                transport=httpx.AsyncHTTPTransport(socket_options=[_TCP_NODELAY_OPT])
             ) as client:
                 response = await client.post(register_url, json=payload)
 
@@ -225,7 +233,8 @@ async def _stream_tts_openai(
     first_chunk_logged = False
 
     async with httpx.AsyncClient(
-        timeout=httpx.Timeout(connect=10.0, read=120.0, write=10.0, pool=10.0)
+        timeout=httpx.Timeout(connect=10.0, read=120.0, write=10.0, pool=10.0),
+        transport=httpx.AsyncHTTPTransport(socket_options=[_TCP_NODELAY_OPT])
     ) as client:
         async with client.stream('POST', url, json=payload) as response:
             if response.status_code != 200:
@@ -233,7 +242,7 @@ async def _stream_tts_openai(
                 logger.error(f"TTS server error {response.status_code}: {body[:500]}")
                 response.raise_for_status()
 
-            async for pcm_chunk in response.aiter_bytes(chunk_size=4096):
+            async for pcm_chunk in response.aiter_bytes(chunk_size=512):
                 if not pcm_chunk:
                     continue
 
