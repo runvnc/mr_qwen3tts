@@ -65,6 +65,18 @@ SEND_TIMESTAMPS = os.environ.get(
     'MR_QWEN3TTS_SEND_TIMESTAMPS', '0'
 ).lower() in ('1', 'true', 'yes', 'on')
 
+# HTTP read size from the OpenAI-compatible Qwen server. 512 lowered TTFA but
+# may amplify streaming/resampling boundary and scheduling artifacts. Default
+# back to 4096 for smoother chunk conversion; override for A/B tests.
+HTTP_CHUNK_SIZE = int(os.environ.get('MR_QWEN3TTS_HTTP_CHUNK_SIZE', '4096'))
+
+# For sentence-at-a-time speak(), audio is contiguous. Let PySIP be the only
+# live RTP clock by default: enqueue frames as generated and let PySIP send them
+# at fixed 20ms cadence. Set MR_QWEN3TTS_USE_PACER=1 to restore the Qwen pacer.
+USE_PACER = os.environ.get(
+    'MR_QWEN3TTS_USE_PACER', '0'
+).lower() in ('1', 'true', 'yes', 'on')
+
 # Per-session speak() locks
 _active_speak_locks: Dict[str, asyncio.Lock] = {}
 # Active AudioPacer instances per log_id (for interrupt support)
@@ -250,7 +262,7 @@ async def _stream_tts_openai(
                 logger.error(f"TTS server error {response.status_code}: {body[:500]}")
                 response.raise_for_status()
 
-            async for pcm_chunk in response.aiter_bytes(chunk_size=512):
+            async for pcm_chunk in response.aiter_bytes(chunk_size=HTTP_CHUNK_SIZE):
                 if not pcm_chunk:
                     continue
 
@@ -377,11 +389,8 @@ async def speak(
         _speak_debug(f"speak() STARTING stream text='{text[:60]}' local={local_playback}")
 
         pacer = None
+        send_to_sip = None
         if not local_playback:
-            pacer = AudioPacer(sample_rate=8000)
-            if log_id:
-                _active_pacers[log_id] = pacer
-
             async def send_to_sip(chunk, timestamp=None, context=None):
                 try:
                     send_ts = timestamp if SEND_TIMESTAMPS else None
@@ -390,7 +399,13 @@ async def speak(
                     logger.error(f"Error sending to SIP: {e}")
                     return False
 
-            await pacer.start_pacing(send_to_sip, context)
+            if USE_PACER:
+                pacer = AudioPacer(sample_rate=8000)
+                if log_id:
+                    _active_pacers[log_id] = pacer
+                await pacer.start_pacing(send_to_sip, context)
+            else:
+                _speak_debug("speak() Qwen AudioPacer disabled; sending chunks directly to SIP/PySIP")
 
         local_audio_buffer = b'' if local_playback else None
         chunk_count = 0
@@ -400,10 +415,16 @@ async def speak(
             if local_playback:
                 local_audio_buffer += chunk
             else:
-                if pacer.interrupted:
-                    _speak_debug(f"speak() INTERRUPTED by pacer after {chunk_count} chunks")
-                    break
-                await pacer.add_chunk(chunk)
+                if pacer:
+                    if pacer.interrupted:
+                        _speak_debug(f"speak() INTERRUPTED by pacer after {chunk_count} chunks")
+                        break
+                    await pacer.add_chunk(chunk)
+                else:
+                    result = await send_to_sip(chunk, timestamp=None, context=context)
+                    if result is False:
+                        _speak_debug(f"speak() direct SIP send stopped after {chunk_count} chunks")
+                        break
 
         _speak_debug(f"speak() stream done, {chunk_count} chunks, pacer.interrupted={pacer.interrupted if pacer else 'N/A'}")
 
