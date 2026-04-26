@@ -71,10 +71,11 @@ SEND_TIMESTAMPS = os.environ.get(
 HTTP_CHUNK_SIZE = int(os.environ.get('MR_QWEN3TTS_HTTP_CHUNK_SIZE', '4096'))
 
 # For sentence-at-a-time speak(), audio is contiguous. Let PySIP be the only
-# live RTP clock by default: enqueue frames as generated and let PySIP send them
-# at fixed 20ms cadence. Set MR_QWEN3TTS_USE_PACER=1 to restore the Qwen pacer.
+# live RTP clock: the Qwen pacer feeds clean 160-byte/20ms frames into mr_sip,
+# but timestamps are still disabled by default, so PySIP owns final RTP timing.
+# Set MR_QWEN3TTS_USE_PACER=0 only for A/B tests.
 USE_PACER = os.environ.get(
-    'MR_QWEN3TTS_USE_PACER', '0'
+    'MR_QWEN3TTS_USE_PACER', '1'
 ).lower() in ('1', 'true', 'yes', 'on')
 
 # Per-session speak() locks
@@ -334,6 +335,7 @@ async def speak(
     log_id = None
     if context and hasattr(context, 'log_id'):
         log_id = context.log_id
+    sip_response_started = False
 
     try:
         _speak_debug(f"speak() CALLED text='{text[:60]}...' log_id={log_id}")
@@ -385,6 +387,13 @@ async def speak(
                     return None
             except Exception:
                 pass
+
+            try:
+                sip_response_started = await service_manager.sip_start_audio_response(context=context)
+                _speak_debug(f"speak() SIP audio response start={sip_response_started}")
+            except Exception as e:
+                # Backward-compatible: older/non-SIP setups may not expose this service.
+                _speak_debug(f"speak() SIP audio response start unavailable: {e}")
 
         _speak_debug(f"speak() STARTING stream text='{text[:60]}' local={local_playback}")
 
@@ -449,6 +458,14 @@ async def speak(
         return None
 
     finally:
+        if sip_response_started:
+            try:
+                ended = await service_manager.sip_end_audio_response(context=context)
+                _speak_debug(f"speak() SIP audio response end={ended}")
+            except Exception as e:
+                logger.warning(f"speak(): failed to end SIP audio response: {e}")
+                _speak_debug(f"speak() SIP audio response end failed: {e}")
+
         if log_id and log_id in _active_speak_locks:
             lock = _active_speak_locks[log_id]
             if lock.locked():
