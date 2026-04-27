@@ -565,6 +565,7 @@ async def speak(
     context: Optional[Dict[str, Any]] = None
 ) -> None:
     """Convert text to speech using Qwen3-TTS streaming."""
+    sip_response_started = False
     try:
         log_id = None
         if context and hasattr(context, 'log_id'):
@@ -623,6 +624,13 @@ async def speak(
             except Exception:
                 pass
         
+        if not local_playback:
+            try:
+                sip_response_started = await service_manager.sip_start_audio_response(context=context)
+                _speak_debug(f"speak() SIP audio response start={sip_response_started}")
+            except Exception as e:
+                _speak_debug(f"speak() SIP audio response start unavailable: {e}")
+
         _speak_debug(f"speak() STARTING stream text='{text[:60]}' local={local_playback}")
 
         pacer = None
@@ -689,6 +697,14 @@ async def speak(
         return None
 
     finally:
+        if sip_response_started:
+            try:
+                ended = await service_manager.sip_end_audio_response(context=context)
+                _speak_debug(f"speak() SIP audio response end={ended}")
+            except Exception as e:
+                logger.warning(f"speak(): failed to end SIP audio response: {e}")
+                _speak_debug(f"speak() SIP audio response end failed: {e}")
+
         if log_id and log_id in _active_speak_locks:
             lock = _active_speak_locks[log_id]
             if lock.locked():

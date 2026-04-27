@@ -184,6 +184,7 @@ async def speak(
     log_id = None
     if context and hasattr(context, 'log_id'):
         log_id = context.log_id
+    sip_response_started = False
 
     try:
         # Per-session serialization
@@ -207,6 +208,13 @@ async def speak(
                     return None
             except Exception:
                 pass
+
+        if not local_playback:
+            try:
+                sip_response_started = await service_manager.sip_start_audio_response(context=context)
+                logger.debug(f"speak() SIP audio response start={sip_response_started}")
+            except Exception as e:
+                logger.debug(f"speak() SIP audio response start unavailable: {e}")
 
         pacer = None
         if not local_playback:
@@ -254,6 +262,13 @@ async def speak(
         return None
 
     finally:
+        if sip_response_started:
+            try:
+                ended = await service_manager.sip_end_audio_response(context=context)
+                logger.debug(f"speak() SIP audio response end={ended}")
+            except Exception as e:
+                logger.warning(f"speak(): failed to end SIP audio response: {e}")
+
         if log_id and log_id in _active_speak_locks:
             lock = _active_speak_locks[log_id]
             if lock.locked():
