@@ -68,7 +68,7 @@ SEND_TIMESTAMPS = os.environ.get(
 # HTTP read size from the OpenAI-compatible Qwen server. 512 lowered TTFA but
 # may amplify streaming/resampling boundary and scheduling artifacts. Default
 # back to 4096 for smoother chunk conversion; override for A/B tests.
-HTTP_CHUNK_SIZE = int(os.environ.get('MR_QWEN3TTS_HTTP_CHUNK_SIZE', '4096'))
+HTTP_CHUNK_SIZE = int(os.environ.get('MR_QWEN3TTS_HTTP_CHUNK_SIZE', '1024'))
 
 # For sentence-at-a-time speak(), audio is contiguous. Let PySIP be the only
 # live RTP clock: the Qwen pacer feeds clean 160-byte/20ms frames into mr_sip,
@@ -77,6 +77,18 @@ HTTP_CHUNK_SIZE = int(os.environ.get('MR_QWEN3TTS_HTTP_CHUNK_SIZE', '4096'))
 USE_PACER = os.environ.get(
     'MR_QWEN3TTS_USE_PACER', '1'
 ).lower() in ('1', 'true', 'yes', 'on')
+
+# ---------------------------------------------------------------------------
+# Shared HTTP client with connection pooling
+# ---------------------------------------------------------------------------
+# Reusing a single AsyncClient eliminates TCP handshake + TLS setup overhead
+# on every TTS request. For localhost:8880 this saves ~5-15ms per sentence.
+# Limits: keep up to 5 idle connections alive, max 10 total.
+_http_client = httpx.AsyncClient(
+    timeout=httpx.Timeout(connect=10.0, read=120.0, write=10.0, pool=10.0),
+    transport=httpx.AsyncHTTPTransport(socket_options=[_TCP_NODELAY_OPT]),
+    limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
+)
 
 # Per-session speak() locks
 _active_speak_locks: Dict[str, asyncio.Lock] = {}
@@ -99,7 +111,6 @@ def _get_local_playback_enabled() -> bool:
 def _is_voice_url(voice: str) -> bool:
     """Check if a voice identifier is a URL (needs auto-registration)."""
     return voice.startswith('http://') or voice.startswith('https://')
-
 
 async def _register_voice_url(voice_url: str, name: str = None) -> str:
     """
@@ -151,24 +162,20 @@ async def _register_voice_url(voice_url: str, name: str = None) -> str:
         _speak_debug(f"Auto-registering voice: {voice_url} -> clone:{name}")
 
         try:
-            async with httpx.AsyncClient(
-                timeout=httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=10.0),
-                transport=httpx.AsyncHTTPTransport(socket_options=[_TCP_NODELAY_OPT])
-            ) as client:
-                response = await client.post(register_url, json=payload)
+            response = await _http_client.post(register_url, json=payload)
 
-                if response.status_code == 200:
-                    result = response.json()
-                    clone_name = result.get("voice_id", f"clone:{name}")
-                    _voice_url_cache[voice_url] = clone_name
-                    logger.info(f"Voice registered: {clone_name}")
-                    _speak_debug(f"Voice registered: {clone_name}")
-                    return clone_name
-                else:
-                    logger.error(f"Voice registration failed ({response.status_code}): {response.text[:500]}")
-                    _speak_debug(f"Voice registration FAILED: {response.status_code}")
-                    # Fall back to using the URL directly (may not work but better than crashing)
-                    return voice_url
+            if response.status_code == 200:
+                result = response.json()
+                clone_name = result.get("voice_id", f"clone:{name}")
+                _voice_url_cache[voice_url] = clone_name
+                logger.info(f"Voice registered: {clone_name}")
+                _speak_debug(f"Voice registered: {clone_name}")
+                return clone_name
+            else:
+                logger.error(f"Voice registration failed ({response.status_code}): {response.text[:500]}")
+                _speak_debug(f"Voice registration FAILED: {response.status_code}")
+                # Fall back to using the URL directly (may not work but better than crashing)
+                return voice_url
 
         except Exception as e:
             logger.error(f"Voice registration error: {e}")
@@ -253,40 +260,36 @@ async def _stream_tts_openai(
     t0 = time.time()
     first_chunk_logged = False
 
-    async with httpx.AsyncClient(
-        timeout=httpx.Timeout(connect=10.0, read=120.0, write=10.0, pool=10.0),
-        transport=httpx.AsyncHTTPTransport(socket_options=[_TCP_NODELAY_OPT])
-    ) as client:
-        async with client.stream('POST', url, json=payload) as response:
-            if response.status_code != 200:
-                body = await response.aread()
-                logger.error(f"TTS server error {response.status_code}: {body[:500]}")
-                response.raise_for_status()
+    async with _http_client.stream('POST', url, json=payload) as response:
+        if response.status_code != 200:
+            body = await response.aread()
+            logger.error(f"TTS server error {response.status_code}: {body[:500]}")
+            response.raise_for_status()
 
-            async for pcm_chunk in response.aiter_bytes(chunk_size=HTTP_CHUNK_SIZE):
-                if not pcm_chunk:
-                    continue
+        async for pcm_chunk in response.aiter_bytes(chunk_size=HTTP_CHUNK_SIZE):
+            if not pcm_chunk:
+                continue
 
-                # Ensure PCM is even-length (complete 16-bit samples for audioop)
-                pcm_chunk = pcm_align_buffer + pcm_chunk
-                if len(pcm_chunk) % 2 != 0:
-                    pcm_align_buffer = pcm_chunk[-1:]
-                    pcm_chunk = pcm_chunk[:-1]
-                else:
-                    pcm_align_buffer = b''
+            # Ensure PCM is even-length (complete 16-bit samples for audioop)
+            pcm_chunk = pcm_align_buffer + pcm_chunk
+            if len(pcm_chunk) % 2 != 0:
+                pcm_align_buffer = pcm_chunk[-1:]
+                pcm_chunk = pcm_chunk[:-1]
+            else:
+                pcm_align_buffer = b''
 
-                if not first_chunk_logged:
-                    logger.info(f"First PCM chunk in {(time.time()-t0)*1000:.0f}ms")
-                    first_chunk_logged = True
+            if not first_chunk_logged:
+                logger.info(f"First PCM chunk in {(time.time()-t0)*1000:.0f}ms")
+                first_chunk_logged = True
 
-                # Convert PCM 24kHz -> ulaw 8kHz
-                ulaw_chunk, resample_state = _pcm24k_to_ulaw8k(pcm_chunk, resample_state)
-                ulaw_buffer += ulaw_chunk
+            # Convert PCM 24kHz -> ulaw 8kHz
+            ulaw_chunk, resample_state = _pcm24k_to_ulaw8k(pcm_chunk, resample_state)
+            ulaw_buffer += ulaw_chunk
 
-                # Yield complete 160-byte frames
-                while len(ulaw_buffer) >= CHUNK_SIZE:
-                    yield ulaw_buffer[:CHUNK_SIZE]
-                    ulaw_buffer = ulaw_buffer[CHUNK_SIZE:]
+            # Yield complete 160-byte frames
+            while len(ulaw_buffer) >= CHUNK_SIZE:
+                yield ulaw_buffer[:CHUNK_SIZE]
+                ulaw_buffer = ulaw_buffer[CHUNK_SIZE:]
 
     # Flush any remaining PCM alignment bytes (shouldn't normally happen)
     if pcm_align_buffer:
@@ -486,3 +489,14 @@ async def on_interrupt(context=None):
     if log_id and log_id in _active_pacers:
         logger.info(f"on_interrupt: interrupting TTS for {log_id}")
         _active_pacers[log_id].interrupt()
+
+
+# ---------------------------------------------------------------------------
+# Shutdown hook - close shared HTTP client
+# ---------------------------------------------------------------------------
+
+@hook()
+async def on_shutdown():
+    """Close the shared httpx client on shutdown to avoid warnings."""
+    logger.info("Closing shared Qwen3-TTS HTTP client")
+    await _http_client.aclose()
