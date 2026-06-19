@@ -46,6 +46,7 @@ class AudioPacer:
         self.audio_start_time: Optional[float] = None
         self._finished_adding = False
         self._interrupted = False
+        self._resume = False
         
         # Pre-buffer state
         self._pre_buffering = True
@@ -115,6 +116,7 @@ class AudioPacer:
         self.start_time = time.perf_counter()
         self.bytes_sent = 0
         self.audio_start_time = None
+        self._resume = False
         self._pre_buffering = True
         self._pre_buffer_accumulated = 0
         self._underrun_count = 0
@@ -134,6 +136,16 @@ class AudioPacer:
 
             if len(self.buffer) > 0:
                 chunk = self.buffer.popleft()
+
+                # Re-anchor timing to wall-clock when audio resumes after a true
+                # buffer-empty gap (e.g. LLM think latency between utterances).
+                # Without this, chunk_timestamp only advances by audio sent, so
+                # the gap is collapsed and the recording shows outgoing speech
+                # starting instantly after the caller stops.
+                if self._resume:
+                    self.audio_start_time = time.perf_counter()
+                    self.bytes_sent = 0
+                    self._resume = False
                 
                 # Calculate timestamp for this chunk
                 if self.audio_start_time:
@@ -174,6 +186,7 @@ class AudioPacer:
             else:
                 if self._finished_adding:
                     break
+                self._resume = True
                 # Buffer empty but not finished - short sleep
                 self._underrun_count += 1
                 if self._underrun_count <= 3:

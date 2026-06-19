@@ -37,6 +37,7 @@ class AudioPacer:
         self.audio_start_time: Optional[float] = None
         self._finished_adding = False
         self._interrupted = False
+        self._resume = False
 
     async def add_chunk(self, audio_bytes: bytes):
         """Add audio chunk to buffer."""
@@ -91,6 +92,7 @@ class AudioPacer:
         self.start_time = time.perf_counter()
         self.bytes_sent = 0
         self.audio_start_time = None
+        self._resume = False
         
         self.pacer_task = asyncio.create_task(self._pace_loop())
 
@@ -102,6 +104,15 @@ class AudioPacer:
             
             if len(self.buffer) > 0:
                 chunk = self.buffer.popleft()
+
+                # Re-anchor timing to wall-clock when audio resumes after idle.
+                # Without this, chunk_timestamp only advances by audio sent, so
+                # wall-clock pauses between utterances are collapsed (recording
+                # shows outgoing speech starting instantly after the caller stops).
+                if self.audio_start_time is None or self._resume:
+                    self.audio_start_time = time.perf_counter()
+                    self.bytes_sent = 0
+                    self._resume = False
                 
                 # Calculate timestamp for this chunk
                 if self.audio_start_time:
@@ -134,6 +145,7 @@ class AudioPacer:
             else:
                 if self._finished_adding:
                     break
+                self._resume = True
                 await asyncio.sleep(0.005)
         
         logger.debug(f"AudioPacer: finished, sent {self.bytes_sent} bytes")
